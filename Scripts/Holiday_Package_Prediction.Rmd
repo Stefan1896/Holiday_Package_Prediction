@@ -1,0 +1,580 @@
+---
+title: 'Holiday Package Prediction'
+output:
+  html_document:
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo=TRUE, error=FALSE, message=FALSE, warning=FALSE)
+knitr::opts_chunk$set(out.width="100%", fig.height = 4.5, split=FALSE, fig.align = 'default', comment = NA)
+options(dplyr.summarise.inform = FALSE)
+```
+
+```{r, out.height = "350px"}
+knitr::include_graphics("reisen.png")
+```
+
+# Introduction
+
+In this project, data from a company named “Trips & Travel.Com” is used with the goal to make marketing expenditure more efficient. The company is planning to launch a new product, a Wellness Tourism Package. Wellness Tourism is defined as Travel that allows the traveler to maintain, enhance or kick-start a healthy lifestyle, and support or increase one’s sense of well-being. For this purpose, available data shall be used to predict the potential customer who is going to purchase the newly introduced travel package. A Random Forrest algorithm will be used for this approach.
+<br/><br/>
+
+*Tasks to Solve:*
+
+- To predict which customers are more likely to purchase the newly introduced travel package
+- To identify which variables are most significant.
+<br/><br/>
+
+# Preperations {.tabset}
+
+## Load Packages
+
+First, relevant packages are loaded. We load a range of libraries for general data wrangling and general visualisation together with more specialised tools for dealing with unbalanced data.
+
+```{r}
+library(here)         #used for folder navigation
+library(tidyverse)    #used for data wrangling
+library(data.table)   #used for data wrangling
+library(skimr)        #used to get overview of data
+library(yarrr)        #used to create "pirateplots"
+library(infer)        #used for Bootstrapp-Based inference 
+library(ggridges)     #used for graphs
+library(tidymodels)   #used for modeling 
+library(tune)         #used for hyperparameter tuning
+library(themis)       #used to expand recipe package for dealing with unbalanced data 
+library(vip)          #used for variable importance
+library(knitr)        #used for table displaying
+library(ggpubr)       #used for annotating figures
+```
+
+## Load Data
+
+The data was downloaded from kaggle and stored locally (login necessary). The here package is used to locate the files relative to the project root. We already have a first look at the amount of missing data:
+
+```{r}
+#get data
+travel <- fread(here("Data", "Travel.csv"))
+
+cat(dim(travel[!complete.cases(travel),])[1], "out of", nrow(travel), "observations have at least one missing value.")
+```
+
+# Data Overview & Preprocessing {.tabset}
+
+## Skim Data I
+
+As a first step, let’s have a quick look at the data using the skim function:
+
+```{r}
+skim(travel)
+```
+
+Notes:
+
+- There is some valuable information in this quick overview. We are dealing with approximately 5% missing data in the variables Age, DurationOfPitch and MonthlyIncome. In addition, there are also (less) missing datapoints in the NumberOfFollowups, PreferredPropertyStar and NumberOfChildrenVising variables.
+
+- There are some variables classified as numeric which should be character instead (e.g. ProdTaken, Passport).
+
+- ProdTaken is our variable which we want to predict. It can be 0 (Wellness Tourism Package not taken) or 1 (Wellness Tourism Package taken).
+
+- The variable names are already clean.
+
+- We can already see that we don’t have to deal with any zero variance variables.
+<br/><br/>
+
+## Skim Data II
+
+Let us have a closer look at the standard deviations of the numeric variables in our dataset in descendig order. This will help us to decide if normalization is necessary. In addition, since some variables like CityTier are classified as numeric although they are truly factor type, we will also have a closer look at the number number of unique values of the numeric variables. This will help to itendify which variables can be converted to factor type.
+
+```{r}
+data_sd <- map_dbl(travel[,-c(1,2)], sd, na.rm=TRUE) %>% 
+              tibble(Variable = names(travel[,-c(1,2)]), sd = .) %>% 
+              filter(sd != "NA") %>% 
+              arrange(-sd) 
+
+data_unique <- map(travel[,-c(1,2)], unique) %>% 
+                lengths(.) %>%
+                tibble(Variable = names(travel[,-c(1,2)]), n_unique = .)
+
+left_join(data_sd, data_unique, by="Variable") %>% kable()
+```
+
+Notes:
+
+- We have very large variability in the MonthlyIncome variable, which means that the data should be normalized for any machine learning model that uses gradient descent algorithm or is based on class distances. With tree based models, we do not need neither normalize the data nor converting factors to dummies.
+
+- We have further information wich variables can be converted to character type.
+<br/><br/>
+
+### Variable Preprocessing
+
+We will convert the identified numeric variables to character class. In addition, we will clean some misspelling in the gender variable and check if remaining gender values are correct. We will leave missing data for now, since we will deal with them later through linear imputation when specifying our prediction model.
+
+```{r}
+#prepocess character variables
+character_variables <- c("ProdTaken", "CityTier", "Passport", "OwnCar", "TypeofContact", "Gender", "Occupation", "MaritalStatus")
+travel <- travel %>% mutate_at(character_variables, as.character)
+travel[ProdTaken == 0, ProdTaken := "No",]
+travel[ProdTaken == 1, ProdTaken := "Yes",]
+
+#clean Gender misspelling
+travel[Gender == "Fe Male", Gender := "Female"]
+cat("Unique gender values:", unique(travel$Gender))
+```
+<br/><br/>
+
+## Outcome Variable
+
+Now let us also have a closer look on the binary outcome Variable, which indicates whether the Holiday Package was taken:
+
+```{r}
+#take a first look at ProdTaken
+travel[order(ProdTaken),.(.N), by = ProdTaken] %>% kable(col.names = c("ProdTaken", "Frequency"))
+prop.table(table(travel$ProdTaken)) %>% kable(col.names = c("ProdTaken", "Proportion"))
+```
+
+Notes:
+
+- We can see already that the ProdTaken variable is unbalanced. We will stratify the training/test set split in the prediction part later to address this issue. We also have to keep in mind when assessing model performance that when using accuracy, even always predicting No will result in an accuracy of 81%.
+<br/><br/>
+
+# Exploratory Analysis {.tabset}
+
+## Monthly Income
+
+### Distribution
+
+Before we start with the prediction, we will have a look at especially important variables and their relationship to the outcome variable. We will start with MonthlyIncome, since this variable has the biggest impact on ProdTaken during Prediction when using all variables in a random forest model.
+
+```{r}
+#distribution of MonthlyIncome
+ggplot(data = travel[!is.na(MonthlyIncome)], aes(x = MonthlyIncome)) + 
+  geom_histogram(bins = 250) +
+  xlab("\nMonthlyIncome") + ylab("Count") +
+  theme_classic() 
+```
+
+Notes:
+
+- All in all, the Monthly Income values are really high (center near 25000?). It is not stated in the dataset description with which currency we are dealing with.
+
+- Another thing to be aware of is the skew of the distribution. Salary data are often right skewed, which means that some very high salaries will have a big influence on mean. Median or log transformation are good solutions to reduce influence of single salary datapoints when examining the relationship between MonthlyIncome and ProdTaken.
+<br/><br/>
+
+### Relationship Monthly Income with Product Taken
+
+We will start now with plotting the relationship between Monthly Income and Customers who took the Product or not. The logarithm is used because of the skewness of the ProdTaken variable. Because we are still dealing with extreme outliers, a second graph is shown where the top and botton 1% of data is removed.
+
+```{r}
+par(mfrow = c(1, 2))
+
+pirateplot(log(MonthlyIncome) ~ ProdTaken, data = travel[!is.na(MonthlyIncome)],
+           theme = 1,
+           gl.col = "white",
+           xlab = "ProdTaken - Original Data",
+           cex.lab = 0.75,
+           cex.axis = 0.75,
+           cex.names = 0.75)
+
+#trimming top and botton 1% of data
+travel_trimmed <- travel[MonthlyIncome %between% quantile(MonthlyIncome, c(.01, .99), na.rm = TRUE)]
+pirateplot(data = travel_trimmed, log(MonthlyIncome) ~ ProdTaken,
+           gl.col = "white",
+           xlab = "ProdTaken - Trimmed Data",
+           cex.lab = 0.75,
+           cex.axis = 0.75,
+           cex.names = 0.75)
+```
+
+Notes:
+
+- Pirateplots use mean by default. The Mean of logged MonthlyIncome is higher for customers who did not take the product.
+
+- Although we used the logarithm of ProdTaken, we still see huge outliers in the data.
+
+- After trimming, the Income is still lower for Customers who took the Wellness Tourism Product.
+<br/><br/>
+
+### Differences in Median
+
+We will also have a look at the median differences because of the skewness:
+
+```{r}
+ggplot(data = travel[!is.na(MonthlyIncome)], aes(x = MonthlyIncome, y = as.factor(ProdTaken), fill = as.factor(ProdTaken)))+
+  stat_density_ridges(quantile_lines = TRUE, quantiles = 2, scale = 3, color = "white") +
+  scale_fill_manual(values = c("grey30", "#9a5ea1"), guide = FALSE) + 
+  labs(x = "\nMonthlyIncome", y = "ProdTaken") +
+  theme_classic()
+```
+
+Notes:
+
+- The white lines in the two graphs are representing the median, which is also higher in the customer group who did not take the Wellness Packages.
+
+- The distributions from the two subgroups are looking quite similar.
+<br/><br/>
+
+### Bootstrapp-Based inference testing
+
+To get a better overview whether this difference is unlikely the result of pure chance (sampling issues), we will do Bootstrapp-Based inference testing. We will first calculate the difference in Monthly Income between the medians of the two groups (Customer who did buy the package vs Customer who did not buy). After that, we will simulate a world where the actual difference in medians between these two groups is zero (shuffling the Product Taken labels within the existing data 5,000 times). We then plot that null distribution, place the observed difference in Income medians in it, and see how well it fits. We will also calculate the probability of seeing a difference as big as found with the get_pvalue() function. 
+
+```{r}
+#calculating the median difference
+diff_med <- travel[!is.na(MonthlyIncome)] %>% 
+  specify(MonthlyIncome ~ ProdTaken) %>% 
+  calculate("diff in medians",
+            order = c("Yes", "No"))
+
+#specify null hypthesis
+ProdTaken_null <- as_tibble(travel[!is.na(MonthlyIncome)]) %>% 
+  specify(MonthlyIncome ~ ProdTaken) %>% 
+  hypothesize(null = "independence") %>% 
+  generate(reps = 5000, type = "permute") %>% 
+  calculate("diff in medians",
+            order = c("Yes", "No"))
+
+#get p-value
+pv <- get_pvalue(ProdTaken_null,obs_stat = diff_med, direction = "both")[[1]]
+
+#get lower and upper bound of Confidence Intervall
+diff_ConfInt <- travel[!is.na(MonthlyIncome)] %>% 
+  specify(MonthlyIncome ~ ProdTaken) %>% 
+  generate(reps = 5000, type = "bootstrap") %>% 
+  calculate("diff in medians",
+            order = c("Yes", "No")) %>%
+  get_confidence_interval()
+
+# Vizualization of Null hypotheses Distribution and actual difference in median 
+
+p <- ProdTaken_null %>%
+      visualize() + 
+      geom_vline(xintercept = diff_med$stat, color = "#FF4136", size = 1) +
+      labs(x = "\nDifference in median proportion\n(Product Taken vs Produkt Not Taken)",
+        y = "Count",
+        subtitle = "Red line shows observed difference in median Income\n") +
+      theme_classic() 
+
+annotate_figure(p, bottom = text_grob(paste0("p-value: ", format.pval(pv)," \n lower bound of ci: ", round(diff_ConfInt[[1]], 0), "\n upper bound of ci: ", round(diff_ConfInt[[2]],0)),
+               hjust = 1, x = 1, color = "red", size = 10)
+               )
+```
+
+Notes:
+
+- The red line represents our measured difference in median MonthlyIncome between our two groups (value: `r diff_med[[1]]`). This red line is pretty far in the left tail of the distribution and seems atypical, which indicates a small p-value.
+
+- The p Value is indeed way smaller than 0.05. That is pretty strong evidence, and I’d feel confident declaring that there is a statistically significant difference between Median Monthly Income for Customers who took the Product and Customers who did not take it.
+
+- According to the upper bound of the Confidence Interval, we can be be 95% certain that the true median difference between our groups is at least `r round(diff_ConfInt[[2]],0)`.
+<br/><br/>
+
+## Character Variables
+
+We will only look quickly at the character variables by looking at the mean percentage that customers did take the Wellnes Product for each unique value of the character variables. The y-axis is Percentage of ProductTaken for all following graphs:
+
+```{r}
+#helper function to get percentages how often the target Product was taken
+get_percentage <- function(x){
+  length(x[x == "Yes"]) / length(x)
+}
+
+#loop through character variable names to plot each character variable in its relationship with Percentage of ProductTaken
+p <- list()
+j = 1
+for(i in c(character_variables[-1])){
+  temp <- travel[, .(Percentage_ProductTaken = get_percentage(ProdTaken)), by = i]
+  p[[j]] <- ggplot(aes_string(x=names(temp)[1], y=names(temp)[2]), data = temp) +
+                geom_bar(stat="identity") +
+                ggtitle(paste0(names(temp[1]))) +
+                xlab("") +
+                ylab("") +
+                theme_classic() +
+                theme(plot.title = element_text(hjust = 0.5)) +
+                theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank())
+  j = j+1
+}
+do.call(grid.arrange,p)
+```
+
+Notes:
+
+- We can see that the differences in the Percentages are quite big for the variables CityTier, Passport, TypeOfContract, Occupation and MaritalStatus.
+<br/><br/>
+
+## Duration of Pitch
+
+We finally look at Duration of Pitch before we start our prediction:
+
+```{r}
+#there was one big outlier with duration > 100
+pirateplot(data = travel[DurationOfPitch < 100], DurationOfPitch ~ ProdTaken,
+           gl.col = "white",
+           cex.lab = 0.75,
+           cex.axis = 0.75,
+           cex.names = 0.75)
+```
+
+Notes:
+
+- The longer the pitch, the more often the Wellnes Product will be taken!
+<br/><br/>
+
+# Modelling
+
+All in all, we see many variables which have a meaningfull relationship with ProdTaken. During model testing on a cross validation subset, a model with all variables got the highest accuracy rates and will be used for our Random Forest Model.
+
+We start to prepare our data by splitting it put into a training and testing set. As said before, we will stratify the split to address that the outcome variable is unbalanced. Resampling will be used with the training data in form of cross-validation. This will help us evaluate our model. Our random forest model is specified with the parsnip package:
+
+
+```{r}
+set.seed(1234)
+split_travel <- initial_split(travel[,-"CustomerID"], prop = 0.7, 
+                              strata = ProdTaken)
+#split to training and testing data
+training_travel <- training(split_travel)
+testing_travel <- testing(split_travel)
+
+#cross-validation subset
+vfold_travel <- rsample::vfold_cv(data = training_travel, v = 10)
+
+#specify random forest model
+rf <-  parsnip::rand_forest(trees = 1000) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+rf
+```
+
+## Feature engineering {.tabset}
+
+### Building Recipe
+
+The recipes package provides an easy way to combine all the transformations and other features related to the model as a single block that can be used for any other subset of the data.
+
+For our case we tested two different recipes:
+
+Recipe 1: 
+
+- Imputing the missing values by predicting them from categorial variables.
+
+
+Recipe 2: 
+
+- Imputing the missing values by predicting them from categorial variables. 
+- Removing highly correlated predictors using threshold 0.8. 
+- Normalizing the data  
+- Using the subsampling method smote to create a balanced data.
+
+Since Recipe 1 did get a much higher accuracy, we only focus on Recipe 1 in further analyses. 
+
+```{r}
+data_recipe <- training_travel %>%
+  recipe(ProdTaken ~ .) %>%
+  step_impute_linear(all_numeric(),
+                     impute_with = all_nominal())
+
+# accuracy with more variable preproessing was worse, so the second recipe was used:
+data_recipe2 <- training_travel %>%
+  recipe(ProdTaken ~ .) %>%
+      step_impute_linear(all_numeric(), impute_with = all_nominal()) %>%
+      step_dummy(all_predictors()) %>%
+      step_corr(all_predictors(), threshold = 0.8) %>% 
+      step_normalize(all_numeric()) %>%
+      step_smote(ProdTaken) 
+```
+
+### Skim Preprocessed Data
+
+We will optionally perform the preprocessing to see how it influences the data:
+
+```{r}
+
+prepped_rec <- prep(data_recipe, verbose = TRUE, retain = TRUE)
+
+#Let us have a look at the preprocessed training data
+preproc_train <- recipes::bake(prepped_rec, new_data = NULL)
+skim(preproc_train)
+```
+
+Notes:
+
+- As expected, there are no remaining missing datapoints in the preprocessed dataset.
+
+
+## Build workflow and run model on cross-validation subset
+
+To well organize our workflow in a structured and smoother way, we use the workflow package that is one of the tidymodels collection. We will run a first Random Forest Model on the cross-validation dataset to get an impression about performance without hyperparameter tuning:
+
+```{r}
+rf_wf <- workflows::workflow() %>%
+  workflows::add_recipe(data_recipe) %>% 
+  workflows::add_model(rf)
+
+model_rf <- rf_wf %>% fit_resamples(vfold_travel, control = control_resamples(save_pred = TRUE))
+model_rf_pred <- collect_predictions(model_rf)
+cm <- caret::confusionMatrix(factor(model_rf_pred$ProdTaken, levels = c("Yes", "No")), factor(model_rf_pred$.pred_class, levels = c("Yes", "No"))) 
+t1 <- head(cm$overall, 4)
+t2 <- head(cm$byClass,4)
+
+knitr::kable(
+  list(t1, t2), col.names = "",
+)
+
+```
+
+Without further optimizing, we get:
+
+- an Accuracy of `r round(cm$overall[[1]]*100,2)`%
+- a Sensitivity of `r round(cm$byClass[[1]]*100,2)`% 
+- a Specificity of `r round(cm$byClass[[2]]*100,2)`%
+
+
+## Tuning Hyperparamters
+
+Since we get an Accuracy of approx. 81% with just predicting No for all datapoints, let us now try to improve performance in the next step through hyperparameter tuning. After tuning, we will finalize our model by automatically choosing the best peformaning paramters, fit them to the whole training set and afterwards assess the performance on the test set.
+
+First, to tune the decision tree hyperparameters mtry and min_n, we create a model specification that identifies which hyperparameters we plan to tune. We can’t train this specification on a single data set (such as the entire training set) and learn what the hyperparameter values should be, therefore we will train many models using resampled data and see which models turn out best. We will also create a regular grid of values to try using some convenience functions for each hyperparameter. 
+
+Once we have our tuning results, we can explore them through visualization and then select the best result. The function collect_metrics() gives us a tidy tibble with all the results. Let us look at the tuning results in a table and in a plot:
+
+```{r}
+set.seed(1234)
+
+# tune mtry and min_n
+rf_tuning <-  parsnip::rand_forest(trees = 1000,
+                                    mtry = tune(), 
+                                    min_n = tune() 
+                                   ) %>%
+                      set_engine("ranger", importance = "impurity") %>%
+                      set_mode("classification")
+
+
+#create grid of values to try 
+rf_grid <- grid_regular(min_n(range = c(2,8)), 
+                        mtry(range= c (2,17)),
+                        levels = 5)
+
+recipe_tuning <- data_recipe #concentrate on paramters of model first
+
+# put together in a workflow
+rf_wf_tune <- workflows::workflow() %>%
+  workflows::add_recipe(recipe_tuning) %>% 
+  workflows::add_model(rf_tuning)
+
+#train hyperparameters
+set.seed(1234)
+
+rf_res <- rf_wf_tune %>% 
+  tune::tune_grid(resamples = vfold_travel, 
+                  grid = rf_grid)
+
+# safe tuning results
+tuning_results <- rf_res %>% collect_metrics %>% arrange(.metric ,-mean)
+kable(head(tuning_results,4))
+
+rf_res %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Accuracy") +
+  theme_classic()
+
+```
+
+Notes: 
+
+- For the min_n parameter, the accuracy is higher for smaller values
+
+- For the mtry paramater, the accuracy is higher for higher values.
+
+- We got the highest accuracy for a min_n value of `r tuning_results$min_n[[1]]` and a mtry value of `r tuning_results$mtry[[1]]`.
+<br/><br/>
+
+#### Select best accuracy
+
+We use the select_best() function to pull out the single set of hyperparameter values for our best decision tree model. We will show the accuracy on the cross-validation subset with this selection:
+
+
+```{r}
+best_rf <- rf_res %>%
+  select_best("accuracy")
+
+final_wf <- rf_wf_tune %>% 
+  finalize_workflow(best_rf)
+
+final_cv_performance <- final_wf %>% fit_resamples(vfold_travel, control = control_resamples(save_pred = TRUE))
+
+
+kable(collect_metrics(final_cv_performance))
+```
+
+Notes:
+
+- On our resampled data, we were able to increase Accuracy through hyperparamter tuning by `r round(collect_metrics(final_cv_performance)$mean[[1]]*100 - collect_metrics(model_rf)$mean[[1]]*100,2)`%. 
+
+
+## Finalize model
+
+ It is time to assess final performance on the test set. Let’s fit this final model to the training data and use our test data to estimate the model performance we expect to see with new data:
+
+```{r}
+final_fit <- final_wf %>% 
+  last_fit(split_travel)
+
+final_accuracy <- final_fit %>%
+                      collect_metrics()
+
+#get final predictions
+final_fit_pred <- final_fit[[5]][[1]]
+#get confusion matrix
+final_cm <- caret::confusionMatrix(factor(testing_travel$ProdTaken, levels = c("Yes", "No")), factor(final_fit_pred$.pred_class, levels = c("Yes", "No")))
+final_cm
+
+
+```
+
+Notes: 
+
+- All in all, we get get a final accuracy of `r round(final_accuracy$.estimate[1]*100,2)`%, which is higher than just predicting No in the unbalanced data. 
+
+- The specificity rate related to the minor class is `r round(final_cm$byClass[[1]]*100,2)`% and is quite similar to the sensitivity with `r round(final_cm$byClass[[2]]*100,2)`%. 
+
+- We did a good job in dealing with the imbalance in our dataset and improving the performance!
+
+
+## Variable importance
+
+```{r}
+final_fit %>%
+  extract_workflow()%>%
+  extract_fit_parsnip() %>% 
+  vip() +
+  theme_classic()
+```
+
+# Conclusion
+
+In this project, we used a Random Forest model to predict which customers will buy a new Wellness Product. The final accuracy is `r round(final_accuracy$.estimate[1]*100,2)`% on the test set. The most important variables for prediction were MonthlyIncome, Age, DurationOfPitch and ProductPitched. We also found evidence that the relationship between MonthlyIncome and ProdTaken was not due to chance and is generizable to new customers.
+<br/><br/>
+<br/><br/>
+
+
+
+
+
+
+
+
+
